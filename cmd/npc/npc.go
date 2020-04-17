@@ -1,20 +1,22 @@
 package main
 
 import (
+	"ehang.io/nps/client"
+	"ehang.io/nps/lib/common"
+	"ehang.io/nps/lib/config"
+	"ehang.io/nps/lib/file"
+	"ehang.io/nps/lib/install"
+	"ehang.io/nps/lib/version"
 	"flag"
 	"fmt"
 	"github.com/astaxie/beego/logs"
 	"github.com/ccding/go-stun/stun"
-	"github.com/cnlh/nps/client"
-	"github.com/cnlh/nps/lib/common"
-	"github.com/cnlh/nps/lib/config"
-	"github.com/cnlh/nps/lib/file"
-	"github.com/cnlh/nps/lib/install"
-	"github.com/cnlh/nps/lib/version"
 	"github.com/kardianos/service"
 	"os"
+	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -33,6 +35,9 @@ var (
 	localType    = flag.String("local_type", "p2p", "p2p target")
 	logPath      = flag.String("log_path", "", "npc log path")
 	debug        = flag.Bool("debug", true, "npc debug")
+	pprofAddr    = flag.String("pprof", "", "PProf debug addr (ip:port)")
+	stunAddr     = flag.String("stun_addr", "stun.stunprotocol.org:3478", "stun server address (eg:stun.stunprotocol.org:3478)")
+	ver          = flag.Bool("version", false, "show current version")
 )
 
 func main() {
@@ -40,6 +45,10 @@ func main() {
 	logs.Reset()
 	logs.EnableFuncCallDepth(true)
 	logs.SetLogFuncCallDepth(3)
+	if *ver {
+		common.PrintVersion()
+		return
+	}
 	if *logPath == "" {
 		*logPath = common.GetNpcLogPath()
 	}
@@ -54,8 +63,6 @@ func main() {
 
 	// init service
 	options := make(service.KeyValue)
-	options["Restart"] = "on-success"
-	options["SuccessExitStatus"] = "1 2 8 SIGKILL"
 	svcConfig := &service.Config{
 		Name:        "Npc",
 		DisplayName: "nps内网穿透客户端",
@@ -66,6 +73,8 @@ func main() {
 		svcConfig.Dependencies = []string{
 			"Requires=network.target",
 			"After=network-online.target syslog.target"}
+		svcConfig.Option["SystemdScript"] = install.SystemdScript
+		svcConfig.Option["SysvScript"] = install.SysvScript
 	}
 	for _, v := range os.Args[1:] {
 		switch v {
@@ -82,7 +91,12 @@ func main() {
 	}
 	s, err := service.New(prg, svcConfig)
 	if err != nil {
-		logs.Error(err)
+		logs.Error(err, "service function disabled")
+		run()
+		// run without service
+		wg := sync.WaitGroup{}
+		wg.Add(1)
+		wg.Wait()
 		return
 	}
 	if len(os.Args) >= 2 {
@@ -99,22 +113,55 @@ func main() {
 			install.UpdateNpc()
 			return
 		case "nat":
-			nat, host, err := stun.NewClient().Discover()
+			c := stun.NewClient()
+			c.SetServerAddr(*stunAddr)
+			nat, host, err := c.Discover()
 			if err != nil || host == nil {
 				logs.Error("get nat type error", err)
 				return
 			}
 			fmt.Printf("nat type: %s \npublic address: %s\n", nat.String(), host.String())
 			os.Exit(0)
-		case "install", "start", "stop", "uninstall", "restart":
-			if os.Args[1] == "install" {
-				service.Control(s, "stop")
-				service.Control(s, "uninstall")
-				install.InstallNpc()
+		case "start", "stop", "restart":
+			// support busyBox and sysV, for openWrt
+			if service.Platform() == "unix-systemv" {
+				logs.Info("unix-systemv service")
+				cmd := exec.Command("/etc/init.d/"+svcConfig.Name, os.Args[1])
+				err := cmd.Run()
+				if err != nil {
+					logs.Error(err)
+				}
+				return
 			}
 			err := service.Control(s, os.Args[1])
 			if err != nil {
-				logs.Error("Valid actions: %q\n", service.ControlAction, err.Error())
+				logs.Error("Valid actions: %q\n%s", service.ControlAction, err.Error())
+			}
+			return
+		case "install":
+			service.Control(s, "stop")
+			service.Control(s, "uninstall")
+			install.InstallNpc()
+			err := service.Control(s, os.Args[1])
+			if err != nil {
+				logs.Error("Valid actions: %q\n%s", service.ControlAction, err.Error())
+			}
+			if service.Platform() == "unix-systemv" {
+				logs.Info("unix-systemv service")
+				confPath := "/etc/init.d/" + svcConfig.Name
+				os.Symlink(confPath, "/etc/rc.d/S90"+svcConfig.Name)
+				os.Symlink(confPath, "/etc/rc.d/K02"+svcConfig.Name)
+			}
+			return
+		case "uninstall":
+			err := service.Control(s, os.Args[1])
+			if err != nil {
+				logs.Error("Valid actions: %q\n%s", service.ControlAction, err.Error())
+			}
+			if service.Platform() == "unix-systemv" {
+				logs.Info("unix-systemv service")
+				os.Remove("/etc/rc.d/S90" + svcConfig.Name)
+				os.Remove("/etc/rc.d/K02" + svcConfig.Name)
 			}
 			return
 		}
@@ -147,6 +194,16 @@ func (p *npc) run() error {
 			logs.Warning("npc: panic serving %v: %v\n%s", err, string(buf))
 		}
 	}()
+	run()
+	select {
+	case <-p.exit:
+		logs.Warning("stop...")
+	}
+	return nil
+}
+
+func run() {
+	common.InitPProfFromArg(*pprofAddr)
 	//p2p or secret command
 	if *password != "" {
 		commonConfig := new(config.CommonConfig)
@@ -161,7 +218,6 @@ func (p *npc) run() error {
 		commonConfig.Client = new(file.Client)
 		commonConfig.Client.Cnf = new(file.Config)
 		go client.StartLocalServer(localServer, commonConfig)
-		return nil
 	}
 	env := common.GetEnvMap()
 	if *serverAddr == "" {
@@ -185,9 +241,4 @@ func (p *npc) run() error {
 		}
 		go client.StartFromFile(*configPath)
 	}
-	select {
-	case <-p.exit:
-		logs.Warning("stop...")
-	}
-	return nil
 }
